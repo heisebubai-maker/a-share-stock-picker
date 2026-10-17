@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>A股研究台</title><link rel="stylesheet" href="/static/style.css"></head>
+<body><main><header><div><small>LOCAL RESEARCH / PHASE 01</small><h1>A股研究台</h1><p>每日筛选 · 因子解释 · 盘后记录</p></div><span class="badge">模拟数据</span></header>
+<aside>当前为固定种子生成的虚构样本，日期仅用于演示，不是实际交易日历或真实行情。评分是规则排序，不代表盈利概率。</aside>
+<section class="toolbar"><label>样本日期 <select id="day" aria-label="样本日期"></select></label><button id="screen">刷新筛选</button><button id="generate">生成 / 更新复盘</button></section>
+<p id="status" role="status" aria-live="polite">正在载入…</p><section id="metrics" class="metrics"></section>
+<section class="panel"><h2>候选观察列表</h2><p>动量 40 + 趋势 30 + 稳定性 20 + 流动性 10；排除 ST、停牌、历史不足和低成交额样本。</p><div class="scroll"><table><thead><tr><th>样本</th><th>收盘</th><th>总分</th><th>20期涨跌</th><th>因子得分（动量 / 趋势 / 稳定 / 流动）</th></tr></thead><tbody id="rows"></tbody></table></div></section>
+<section class="panel"><h2>每日复盘</h2><p id="review">选择日期后生成复盘，保存当日评分快照。</p><label for="notes">观察记录</label><textarea id="notes" maxlength="5000" placeholder="记录信号、风险和后续验证事项（最多5000字）"></textarea><button id="save" disabled>保存记录</button></section>
+<footer>本地单用户研究工具 · 无自动下单 · 无收益承诺 · API 文档 <a href="/docs">/docs</a></footer></main><script src="/static/app.js"></script></body></html>
