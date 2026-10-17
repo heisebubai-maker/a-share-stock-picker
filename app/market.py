@@ -58,11 +58,11 @@ def validate_rows(rows, codes, start, end):
     return clean
 
 
-def download(codes, start, end):
+def download(codes, start, end, include_context=False):
     codes = normalize_codes(codes)
     if not start <= end < china_today() or (end - start).days > 370:
         raise ValueError('日期范围最多370天，结束日期必须早于今天，避免使用未收盘行情')
-    request = json.dumps(dict(codes=codes, start=start.isoformat(), end=end.isoformat()))
+    request = json.dumps(dict(codes=codes, start=start.isoformat(), end=end.isoformat(),include_context=include_context))
     last_error = None
     # Each attempt has its own SDK session. Total runtime <= 2 * 90 seconds.
     for attempt in range(2):
@@ -76,7 +76,27 @@ def download(codes, start, end):
                 raise DataError('下载进程返回格式异常')
             if process.returncode or payload.get('error'):
                 raise DataError(payload.get('error', '下载进程异常'))
-            return validate_rows(payload['rows'], codes, start, end)
-        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError, DataError) as exc:
+            cleaned=validate_rows(payload['rows'], codes, start, end)
+            if not include_context:
+                return cleaned
+            original={(r['code'],r['day']):r for r in payload['rows']}
+            for row in cleaned:
+                detail=original[(row['code'],row['day'])]
+                row['sector']=str(detail.get('sector') or '')[:80] or None
+                for key in ('pe','pb'):
+                    value=detail.get(key)
+                    row[key]=float(value) if value is not None and isfinite(float(value)) else None
+            benchmarks=[]
+            seen=set()
+            for row in payload.get('benchmarks',[]):
+                key=(row['code'],row['day'])
+                if (row['code'] not in ('sh.000001','sh.000300','sz.399006') or key in seen or
+                        not start<=date.fromisoformat(row['day'])<=end or
+                        not isfinite(float(row['close'])) or float(row['close'])<=0):
+                    raise DataError('指数行情校验失败')
+                seen.add(key)
+                benchmarks.append(dict(code=row['code'],day=row['day'],close=float(row['close'])))
+            return dict(rows=cleaned,benchmarks=benchmarks)
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError, TypeError, ValueError, DataError) as exc:
             last_error = exc
     raise DataError(f'BaoStock同步失败（已尝试2次）：{last_error}。保留原缓存，不切换模拟数据。')

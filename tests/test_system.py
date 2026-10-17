@@ -59,7 +59,7 @@ def test_filters_and_future_data(client):
 
 
 def test_static_and_cross_origin(client):
-    assert '真实日线同步' in client.get('/').text
+    assert '我的持仓复盘' in client.get('/').text
     assert client.get('/static/app.js').status_code == 200
     assert client.post('/api/reviews/2026-10-16',headers={'Origin':'https://evil.example'}).status_code == 403
     with pytest.raises(ValueError): get_provider('live')

@@ -72,7 +72,7 @@ def test_real_source_cache_and_failure(tmp_path,monkeypatch):
     sync=endpoint(app,'/api/sync','POST')
     assert status()['latest_day'] is None and not status()['simulated']
     request=SyncRequest(codes=['600000'],start=START,end=END)
-    monkeypatch.setattr(main,'download',lambda *a: bars())
+    monkeypatch.setattr(main,'download',lambda *a: dict(rows=bars(),benchmarks=[]))
     assert sync(request)['sync']['row_count']==25
     screen=endpoint(app,'/api/screen')
     result=screen(date(2026,1,25),10)
@@ -87,7 +87,7 @@ def test_real_source_cache_and_failure(tmp_path,monkeypatch):
     with pytest.raises(HTTPException) as error: sync(request)
     assert error.value.status_code==502
     assert screen(day,10)==result
-    monkeypatch.setattr(main,'download',lambda *a: bars())
+    monkeypatch.setattr(main,'download',lambda *a: dict(rows=bars(),benchmarks=[]))
     sync(request)  # lock released after failure
     assert generate(day)['notes']=='研究记录'
     with connect(path) as db:

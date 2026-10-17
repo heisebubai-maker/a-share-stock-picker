@@ -1,25 +1,56 @@
 import json
 import os
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, ConfigDict
 
 from .providers import get_provider
 from .storage import connect, initialize, save_market
 from .strategy import VERSION, evaluate
 from .market import DEFAULT_CODES, DataError, china_today, download, normalize_codes
+from .research import build_report
 
 ROOT = Path(__file__).resolve().parent
 
 
 class Note(BaseModel):
     notes: str = Field(max_length=5000)
+
+
+class Holding(BaseModel):
+    model_config=ConfigDict(allow_inf_nan=False)
+    code: str
+    cost: float = Field(gt=0,le=1000000)
+    quantity: int = Field(gt=0,le=100000000,strict=True)
+    horizon: Literal['swing','long'] = 'swing'
+    thesis: str = Field(default='',max_length=1000)
+
+    @model_validator(mode='after')
+    def normalize(self):
+        self.code=normalize_codes([self.code])[0]
+        return self
+
+
+class Preferences(BaseModel):
+    model_config=ConfigDict(allow_inf_nan=False)
+    cash: float=Field(default=0,ge=0,le=1e12)
+    max_stock_pct: float=Field(default=20,gt=0,le=100)
+    max_total_pct: float=Field(default=70,gt=0,le=100)
+    max_loss_pct: float=Field(default=8,ge=1,le=30)
+    risk_pct: float=Field(default=1,gt=0,le=5)
+
+    @model_validator(mode='after')
+    def consistent(self):
+        if self.max_stock_pct>self.max_total_pct:
+            raise ValueError('单只仓位上限不能超过总仓位上限')
+        return self
 
 
 class SyncRequest(BaseModel):
@@ -40,6 +71,8 @@ def create_app(db_path=None, source=None):
     provider = get_provider(source or os.environ.get("STOCK_SOURCE", "baostock"))
     simulated = provider.name == 'demo'
     sync_lock = Lock()
+    job_lock=Lock()
+    job=dict(state='idle',message='尚未更新',started_at=None,finished_at=None)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -96,8 +129,11 @@ def create_app(db_path=None, source=None):
         if not sync_lock.acquire(blocking=False):
             raise HTTPException(409, '同步进行中，请稍后重试')
         try:
-            rows = download(payload.codes, payload.start, payload.end)
-            save_market(path, provider.name, rows, payload.codes, payload.start, payload.end)
+            with connect(path) as db:
+                held=[r[0] for r in db.execute('SELECT code FROM holdings')]
+            codes=normalize_codes(payload.codes+held)
+            bundle = download(codes, payload.start, payload.end, True)
+            save_market(path, provider.name, bundle['rows'], codes, payload.start, payload.end,bundle['benchmarks'])
             return data_status()
         except DataError as exc:
             raise HTTPException(502, str(exc)) from exc
@@ -105,6 +141,96 @@ def create_app(db_path=None, source=None):
             raise HTTPException(422, str(exc)) from exc
         finally:
             sync_lock.release()
+
+    @app.get('/api/dashboard')
+    def dashboard(day: date | None = None):
+        return build_report(path,provider.name,day)
+
+    @app.get('/api/holdings')
+    def holdings():
+        with connect(path) as db:
+            return [dict(r) for r in db.execute('SELECT * FROM holdings ORDER BY code')]
+
+    @app.put('/api/holdings')
+    def save_holding(payload: Holding):
+        with connect(path) as db:
+            count=db.execute('SELECT COUNT(*) FROM holdings').fetchone()[0]
+            exists=db.execute('SELECT 1 FROM holdings WHERE code=?',(payload.code,)).fetchone()
+            if count>=50 and not exists:
+                raise HTTPException(422,'最多记录50只持仓')
+            db.execute('INSERT OR REPLACE INTO holdings VALUES(?,?,?,?,?,?)',
+                       (payload.code,payload.cost,payload.quantity,payload.horizon,payload.thesis,
+                        datetime.now(timezone.utc).isoformat()))
+        return holdings()
+
+    @app.delete('/api/holdings/{code}')
+    def remove_holding(code: str):
+        try: code=normalize_codes([code])[0]
+        except ValueError as exc: raise HTTPException(422,str(exc)) from exc
+        with connect(path) as db:
+            db.execute('DELETE FROM holdings WHERE code=?',(code,))
+        return holdings()
+
+    @app.get('/api/preferences')
+    def preferences():
+        with connect(path) as db:
+            return dict(db.execute('SELECT * FROM preferences WHERE id=1').fetchone())
+
+    @app.put('/api/preferences')
+    def save_preferences(payload: Preferences):
+        with connect(path) as db:
+            db.execute('UPDATE preferences SET cash=?,max_stock_pct=?,max_total_pct=?,max_loss_pct=?,risk_pct=? WHERE id=1',
+                       (payload.cash,payload.max_stock_pct,payload.max_total_pct,payload.max_loss_pct,payload.risk_pct))
+        return preferences()
+
+    def store_report():
+        report=build_report(path,provider.name)
+        if not report['day']:
+            raise HTTPException(409,'暂无行情，先更新行情再保存复盘')
+        with connect(path) as db:
+            db.execute('INSERT OR REPLACE INTO research_reports VALUES(?,?,?,?)',
+                       (provider.name,report['day'],json.dumps(report,ensure_ascii=False),datetime.now(timezone.utc).isoformat()))
+        return report
+
+    @app.post('/api/research-reports')
+    def save_report():
+        return store_report()
+
+    @app.get('/api/research-reports')
+    def report_history():
+        with connect(path) as db:
+            return [dict(r) for r in db.execute('SELECT day,created_at FROM research_reports WHERE source=? ORDER BY day DESC',(provider.name,))]
+
+    @app.get('/api/research-reports/{day}')
+    def saved_report(day: date):
+        with connect(path) as db:
+            row=db.execute('SELECT payload FROM research_reports WHERE source=? AND day=?',(provider.name,day.isoformat())).fetchone()
+        if not row: raise HTTPException(404,'该日尚未保存复盘')
+        return json.loads(row['payload'])
+
+    @app.get('/api/update-status')
+    def update_status():
+        with job_lock:
+            return dict(job)
+
+    @app.post('/api/update')
+    def update(payload: SyncRequest):
+        if simulated: raise HTTPException(409,'模拟模式无法同步真实行情')
+        with job_lock:
+            if job['state']=='running': raise HTTPException(409,'更新进行中，请稍候')
+            job.update(state='running',message='正在获取股票、持仓、行业及指数日线…',
+                       started_at=datetime.now(timezone.utc).isoformat(),finished_at=None)
+        def work():
+            try:
+                sync(payload)
+                store_report()
+                state,message='done','行情已更新，候选与持仓复盘已生成'
+            except Exception as exc:
+                state,message='error',str(exc.detail if isinstance(exc,HTTPException) else exc)
+            with job_lock:
+                job.update(state=state,message=message,finished_at=datetime.now(timezone.utc).isoformat())
+        Thread(target=work,daemon=True).start()
+        return update_status()
 
     @app.get("/api/dates")
     def dates():

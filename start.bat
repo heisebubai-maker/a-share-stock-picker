@@ -9,8 +9,8 @@ if errorlevel 1 goto fail
 if errorlevel 1 goto fail
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 if errorlevel 1 goto fail
-echo Open http://127.0.0.1:8000 in your browser. Ctrl+C to stop.
-".venv\Scripts\python.exe" -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+echo Browser opens when the service is ready. Keep this window open. Ctrl+C to stop.
+".venv\Scripts\python.exe" launch.py
 if errorlevel 1 goto fail
 exit /b 0
 :fail
