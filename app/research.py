@@ -43,6 +43,9 @@ def build_report(path, source, requested_day=None):
     with connect(path) as db:
         settings=dict(db.execute('SELECT * FROM preferences WHERE id=1').fetchone())
         holdings=[dict(r) for r in db.execute('SELECT * FROM holdings ORDER BY code')]
+        feed=db.execute('SELECT vendor,note FROM feed_status WHERE source=?',(source,)).fetchone()
+        vendor=feed['vendor'] if feed else source
+        feed_note=feed['note'] if feed else ''
         latest=db.execute('SELECT MAX(day) FROM bars WHERE source=?',(source,)).fetchone()[0]
         day=requested_day.isoformat() if requested_day else latest
         if day:
@@ -101,6 +104,8 @@ def build_report(path, source, requested_day=None):
         reasons=[]
         if stale:
             status,action='缓存较旧','更新行情后复核'
+        elif last['suspended'] not in (0,1) or last['is_st'] not in (0,1):
+            status,action='交易状态未核验','仅复盘价格，核实ST与停牌状态后再定操作'
         elif last['suspended']:
             status,action='停牌','等待可交易状态，检查公告'
         elif last['is_st']:
@@ -120,6 +125,8 @@ def build_report(path, source, requested_day=None):
                   review_level=metric['resistance'] if metric else None,
                   trigger='先核实停牌/ST/公告与账户可卖数量；收盘触及风险线或趋势持续转弱时复核减仓或退出。',
                   invalidation='若收盘重新站稳20期均线，重新评估趋势；达到压力参考位只触发复盘，不自动止盈。')
+        if status=='交易状态未核验':
+            plan=None
         portfolio.append(dict(**holding,name=last['name'],close=last['close'],value=value,pnl=pnl,
                               pnl_pct=pct,status=status,action=action,reason=' '.join(reasons),plan=plan,
                               day=day))
@@ -132,7 +139,7 @@ def build_report(path, source, requested_day=None):
         item['overweight']=item['weight_pct'] is not None and item['weight_pct']>settings['max_stock_pct']
         if item['overweight']:
             item['action']+='；单股超出设定仓位上限'
-    allowed=not simulated and not stale and len(market_indices)>=2 and regime!='偏弱' and exposure_ok
+    allowed=not simulated and not stale and vendor!='tencent_fallback' and len(market_indices)>=2 and regime!='偏弱' and exposure_ok
     candidates=[]
     sector_counts=defaultdict(int)
     held_codes={h['code'] for h in holdings}
@@ -162,6 +169,7 @@ def build_report(path, source, requested_day=None):
     priority={'已触及风险线':0,'ST风险':1,'停牌':2,'行情缺失':3,'缓存较旧':4,'趋势转弱':5,'历史不足':6,'趋势保持':7}
     portfolio.sort(key=lambda p:(priority.get(p['status'],9),p['code']))
     tasks=[]
+    if vendor=='tencent_fallback': tasks.append(feed_note)
     if not day: tasks.append('先点击“一键更新行情”，获取研究股票池与持仓的真实日线。')
     if stale and day: tasks.append('缓存超过4个自然日或日期异常；仅显示历史复盘，更新前不形成新增仓位计划。')
     if len(market_indices)<2: tasks.append('指数依据不足；暂不形成新增仓位计划，不能把股票池涨跌当作全市场行情。')
@@ -170,9 +178,9 @@ def build_report(path, source, requested_day=None):
     if not exposure_ok and holdings: tasks.append('先处理持仓数据缺失或总仓位超过设定上限的问题。')
     if regime=='偏弱': tasks.append('所覆盖指数均低于20期均线；暂停新增仓位计划，优先复核持仓风险。')
     if settings['cash']==0: tasks.append('未录入可用现金，候选股的新增股数上限为0；请先填写账户与风险参数。')
-    if not candidates and day: tasks.append('当前股票池没有达到候选门槛的个股；允许空结果，不强行推荐。')
+    if not candidates and day and vendor!='tencent_fallback': tasks.append('当前股票池没有达到候选门槛的个股；允许空结果，不强行推荐。')
     tasks.extend(f"{p['code']}：{p['action']}" for p in portfolio if p['status'] not in ('趋势保持',))
-    return dict(version='research-v1',source=source,simulated=simulated,day=day,age_days=age,stale=stale,
+    return dict(version='research-v1',source=source,vendor=vendor,feed_note=feed_note,simulated=simulated,day=day,age_days=age,stale=stale,
                 market=dict(regime=regime,indices=market_indices,pool_size=len(groups),available=len(current),
                             up=sum(x>0 for x in daily),down=sum(x<0 for x in daily),
                             sectors=[dict(name=k,change_pct=round(mean(v),2),count=len(v))

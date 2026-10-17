@@ -3,6 +3,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from math import isfinite
 from pathlib import Path
@@ -58,14 +59,17 @@ def validate_rows(rows, codes, start, end):
     return clean
 
 
-def download(codes, start, end, include_context=False):
+def download(codes, start, end, include_context=False, cached_metadata=None):
     codes = normalize_codes(codes)
     if not start <= end < china_today() or (end - start).days > 370:
         raise ValueError('日期范围最多370天，结束日期必须早于今天，避免使用未收盘行情')
-    request = json.dumps(dict(codes=codes, start=start.isoformat(), end=end.isoformat(),include_context=include_context))
+    request = json.dumps(dict(codes=codes, start=start.isoformat(), end=end.isoformat(),
+                              include_context=include_context,cached_metadata=cached_metadata or {}))
     last_error = None
-    # Each attempt has its own SDK session. Total runtime <= 2 * 90 seconds.
+    # Each attempt has its own SDK session and bounded socket reads.
     for attempt in range(2):
+        if attempt:
+            time.sleep(2)
         try:
             process = subprocess.run([sys.executable, '-m', 'app.market_worker'],
                                      input=request, capture_output=True, text=True, encoding='utf-8',
@@ -75,7 +79,9 @@ def download(codes, start, end, include_context=False):
             if not isinstance(payload, dict):
                 raise DataError('下载进程返回格式异常')
             if process.returncode or payload.get('error'):
-                raise DataError(payload.get('error', '下载进程异常'))
+                detail=payload.get('error','下载进程异常')
+                diagnostic=payload.get('diagnostic','').strip()
+                raise DataError(detail+(f'（连接诊断：{diagnostic[:300]}）' if diagnostic else ''))
             cleaned=validate_rows(payload['rows'], codes, start, end)
             if not include_context:
                 return cleaned
@@ -96,7 +102,15 @@ def download(codes, start, end, include_context=False):
                     raise DataError('指数行情校验失败')
                 seen.add(key)
                 benchmarks.append(dict(code=row['code'],day=row['day'],close=float(row['close'])))
-            return dict(rows=cleaned,benchmarks=benchmarks)
-        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError, TypeError, ValueError, DataError) as exc:
+            expected=payload.get('expected_latest_day')
+            if expected:
+                if not start<=date.fromisoformat(expected)<=end:
+                    raise DataError('交易日历日期超出查询范围')
+                if max(r['day'] for r in cleaned)<expected:
+                    raise DataError(f'供应商股票日线尚未更新至交易日历的{expected}，未覆盖旧缓存')
+            return dict(rows=cleaned,benchmarks=benchmarks,expected_latest_day=expected)
+        except subprocess.TimeoutExpired:
+            last_error='行情服务响应超过90秒，请稍后重试'
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError, DataError) as exc:
             last_error = exc
     raise DataError(f'BaoStock同步失败（已尝试2次）：{last_error}。保留原缓存，不切换模拟数据。')

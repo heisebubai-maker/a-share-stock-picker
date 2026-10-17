@@ -16,6 +16,7 @@ from .storage import connect, initialize, save_market
 from .strategy import VERSION, evaluate
 from .market import DEFAULT_CODES, DataError, china_today, download, normalize_codes
 from .research import build_report
+from .backup_feed import download_backup
 
 ROOT = Path(__file__).resolve().parent
 
@@ -54,6 +55,7 @@ class Preferences(BaseModel):
 
 
 class SyncRequest(BaseModel):
+    feed: Literal['auto','backup'] = 'auto'
     codes: list[str] = Field(default_factory=lambda: list(DEFAULT_CODES), min_length=1, max_length=50)
     start: date = Field(default_factory=lambda: china_today() - timedelta(days=180))
     end: date = Field(default_factory=lambda: china_today() - timedelta(days=1))
@@ -118,9 +120,11 @@ def create_app(db_path=None, source=None):
         with connect(path) as db:
             state = db.execute('SELECT * FROM sync_state WHERE source=?', (provider.name,)).fetchone()
             latest = db.execute('SELECT MAX(day) FROM bars WHERE source=?', (provider.name,)).fetchone()[0]
+            feed=db.execute('SELECT vendor,note FROM feed_status WHERE source=?',(provider.name,)).fetchone()
         return dict(source=provider.name, simulated=simulated, latest_day=latest,
                     age_days=(china_today()-date.fromisoformat(latest)).days if latest else None,
-                    adjustment='none', default_codes=DEFAULT_CODES, sync=dict(state) if state else None)
+                    adjustment='none', default_codes=DEFAULT_CODES, sync=dict(state) if state else None,
+                    vendor=feed['vendor'] if feed else provider.name,feed_note=feed['note'] if feed else '')
 
     @app.post('/api/sync')
     def sync(payload: SyncRequest):
@@ -129,12 +133,49 @@ def create_app(db_path=None, source=None):
         if not sync_lock.acquire(blocking=False):
             raise HTTPException(409, '同步进行中，请稍后重试')
         try:
+            before=data_status()
+            previous=before['latest_day']
             with connect(path) as db:
                 held=[r[0] for r in db.execute('SELECT code FROM holdings')]
             codes=normalize_codes(payload.codes+held)
-            bundle = download(codes, payload.start, payload.end, True)
-            save_market(path, provider.name, bundle['rows'], codes, payload.start, payload.end,bundle['benchmarks'])
-            return data_status()
+            refresh_from=None
+            cached=before['sync']
+            with connect(path) as db:
+                index_count=db.execute('SELECT COUNT(*) FROM benchmarks WHERE source=?',(provider.name,)).fetchone()[0]
+                cached_rows=db.execute('''SELECT b.code,b.name,c.sector FROM bars b LEFT JOIN context c
+                  ON b.source=c.source AND b.code=c.code AND b.day=c.day
+                  WHERE b.source=? ORDER BY b.day DESC''',(provider.name,)).fetchall()
+            metadata={}
+            # Refresh names/industry every Monday even when daily sync keeps the cache timestamp fresh.
+            if cached and china_today().weekday()!=0 and (datetime.now(timezone.utc)-datetime.fromisoformat(cached['updated_at'])).total_seconds()<7*86400:
+                for item in cached_rows:
+                    metadata.setdefault(item['code'],dict(name=item['name'],sector=item['sector']))
+            if (cached and previous and set(json.loads(cached['codes']))==set(codes) and index_count>=63 and
+                    payload.start>=date.fromisoformat(cached['start']) and payload.end>=date.fromisoformat(previous)):
+                refresh_from=max(payload.start,date.fromisoformat(previous)-timedelta(days=10))
+            vendor,note=provider.name,''
+            try:
+                if payload.feed=='backup':
+                    raise DataError('已选择备用线路')
+                bundle = download(codes, refresh_from or payload.start, payload.end, True, metadata)
+            except DataError as primary_error:
+                with job_lock:
+                    if job['state']=='running': job['message']='正在通过腾讯HTTPS备用线路读取真实日线…'
+                try:
+                    bundle=download_backup(codes,refresh_from or payload.start,payload.end,metadata)
+                except DataError as backup_error:
+                    raise DataError(f'主线路和备用线路均未更新成功。{primary_error}；{backup_error}') from backup_error
+                vendor='tencent_fallback'
+                note='近期价格与成交额来自腾讯HTTPS备用线路；早期历史可含BaoStock缓存。ST/停牌状态未取得，暂停新增选股与操作计划。行业仅为缓存参考，PE/PB未补造。'
+            save_market(path, provider.name, bundle['rows'], codes, payload.start, payload.end,bundle['benchmarks'],refresh_from,vendor,note)
+            result=data_status()
+            latest=result['latest_day']
+            result['has_new_trading_day']=previous is None or latest>previous
+            result['message']=(f'已同步新交易日 {latest}，持仓与候选复盘已刷新' if result['has_new_trading_day']
+                               else f'已联网核对行情，最新交易日仍为 {latest}，没有新增交易日；复盘已刷新')
+            if vendor=='tencent_fallback':
+                result['message']+='。已使用腾讯备用日线；交易状态未核验，暂停新增计划'
+            return result
         except DataError as exc:
             raise HTTPException(502, str(exc)) from exc
         except ValueError as exc:
@@ -222,9 +263,9 @@ def create_app(db_path=None, source=None):
                        started_at=datetime.now(timezone.utc).isoformat(),finished_at=None)
         def work():
             try:
-                sync(payload)
+                result=sync(payload)
                 store_report()
-                state,message='done','行情已更新，候选与持仓复盘已生成'
+                state,message='done',result['message']
             except Exception as exc:
                 state,message='error',str(exc.detail if isinstance(exc,HTTPException) else exc)
             with job_lock:

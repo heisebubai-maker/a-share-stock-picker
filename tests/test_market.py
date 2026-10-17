@@ -84,6 +84,7 @@ def test_real_source_cache_and_failure(tmp_path,monkeypatch):
     generate(day); notes(day,Note(notes='研究记录'))
     def failing(*a): raise DataError('网络不可用')
     monkeypatch.setattr(main,'download',failing)
+    monkeypatch.setattr(main,'download_backup',failing)
     with pytest.raises(HTTPException) as error: sync(request)
     assert error.value.status_code==502
     assert screen(day,10)==result

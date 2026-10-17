@@ -24,3 +24,9 @@ FastAPI（MIT）、Uvicorn（BSD-3-Clause）、HTTPX（BSD-3-Clause）、pytest�
 新增 [baostock 0.9.4](https://pypi.org/project/baostock/)，发布页许可证元数据为 BSD License，介绍其免费中国股票数据服务。通过SDK调用官方服务，不复制上游源码；安装包及其依赖许可证需保留。公开元数据并不等于行情可任意再分发授权，本仓库不提交下载行情或运行数据库，默认用于本机个人研究。商业使用和再分发应核实供应商条款。
 
 接口依据：[Python API文档](https://github.com/zxygithub/baostock/blob/master/docs/pythonAPI.md)与[发行方示例](https://pypi.org/project/baostock/)。使用匿名login/logout、股票基本资料和日K查询；adjustflag=3为不复权。选用完整ST/交易状态字段，避免依赖股票名称猜测历史状态。单次查询有进程级超时与一次重试，不采用未经核实的多源字段拼接。
+
+## 备用价格通道（2026-10-17）
+
+通过httpx调用腾讯财经公开HTTPS日线接口，解析代码独立实现，未引入或复制AKShare源码。字段含义以[AKShare维护者实现](https://github.com/akfamily/akshare/blob/main/akshare/stock_feature/stock_hist_tx.py)和实际响应校验：只接受不复权day数据，成交额由万元转为元；旧6字段接口不适用于本系统成交额策略，明确拒绝。该资料用作接口模式核实，不视为腾讯商业行情授权；本项目不再分发下载数据。
+
+备用数据来源显式保存并显示，缺少ST/停牌字段不从另一日猜测，暂停完整筛选与操作计划。保留较早BaoStock历史时在页面注明混合缓存；PE/PB不跨日期拼接。

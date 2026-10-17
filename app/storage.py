@@ -45,26 +45,42 @@ def initialize(path, provider):
         CREATE TABLE IF NOT EXISTS benchmarks (
           source TEXT, code TEXT, day TEXT, close REAL NOT NULL,
           PRIMARY KEY(source,code,day));
+        CREATE TABLE IF NOT EXISTS feed_status (
+          source TEXT PRIMARY KEY,vendor TEXT NOT NULL,note TEXT NOT NULL);
         ''')
         db.executemany('INSERT OR IGNORE INTO bars VALUES (:code,:name,:day,:close,:amount,:is_st,:suspended,:source)',
                        [dict(row, source=provider.name) for row in provider.bars()])
 
 
-def save_market(path, source, rows, codes, start, end, benchmarks=None):
+def save_market(path, source, rows, codes, start, end, benchmarks=None, refresh_from=None,vendor=None,note=''):
     import json
     from datetime import datetime, timezone
     with connect(path) as db:
-        # Current cache is exactly the requested pool/range; never mix stale stocks.
-        db.execute('DELETE FROM bars WHERE source=?', (source,))
+        # For an unchanged pool reuse validated older history, replacing the overlap atomically.
+        if refresh_from:
+            db.execute('DELETE FROM bars WHERE source=? AND (day>=? OR day<? OR day>?)',
+                       (source,refresh_from.isoformat(),start.isoformat(),end.isoformat()))
+        else:
+            db.execute('DELETE FROM bars WHERE source=?', (source,))
         db.executemany('INSERT INTO bars VALUES (:code,:name,:day,:close,:amount,:is_st,:suspended,:source)',
                        [dict(row, source=source) for row in rows])
-        db.execute('DELETE FROM context WHERE source=?', (source,))
+        if refresh_from:
+            db.execute('DELETE FROM context WHERE source=? AND (day>=? OR day<? OR day>?)',
+                       (source,refresh_from.isoformat(),start.isoformat(),end.isoformat()))
+        else:
+            db.execute('DELETE FROM context WHERE source=?', (source,))
         db.executemany('INSERT INTO context VALUES (?,?,?,?,?,?)',
                        [(source,r['code'],r['day'],r.get('sector'),r.get('pe'),r.get('pb')) for r in rows])
         if benchmarks is not None:
-            db.execute('DELETE FROM benchmarks WHERE source=?', (source,))
+            if refresh_from:
+                db.execute('DELETE FROM benchmarks WHERE source=? AND (day>=? OR day<? OR day>?)',
+                           (source,refresh_from.isoformat(),start.isoformat(),end.isoformat()))
+            else:
+                db.execute('DELETE FROM benchmarks WHERE source=?', (source,))
             db.executemany('INSERT INTO benchmarks VALUES (?,?,?,?)',
                            [(source,r['code'],r['day'],r['close']) for r in benchmarks])
+        total=db.execute('SELECT COUNT(*) FROM bars WHERE source=?',(source,)).fetchone()[0]
+        db.execute('INSERT OR REPLACE INTO feed_status VALUES(?,?,?)',(source,vendor or source,note))
         db.execute('''INSERT OR REPLACE INTO sync_state VALUES (?,?,?,?,?,?)''',
                    (source, datetime.now(timezone.utc).isoformat(), start.isoformat(),
-                    end.isoformat(), json.dumps(codes), len(rows)))
+                    end.isoformat(), json.dumps(codes), total))
