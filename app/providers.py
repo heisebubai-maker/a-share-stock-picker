@@ -33,7 +33,17 @@ class DemoProvider:
         return rows
 
 
+class BaoStockProvider:
+    name = "baostock"
+
+    def bars(self):
+        # Never download at startup: cached research stays available offline.
+        return []
+
+
 def get_provider(name: str) -> Provider:
-    if name != "demo":
-        raise ValueError("仅支持 demo；真实数据源尚未接入，禁止静默回退")
-    return DemoProvider()
+    if name == 'baostock':
+        return BaoStockProvider()
+    if name == 'demo':
+        return DemoProvider()
+    raise ValueError('未知数据源；仅支持baostock或demo，禁止静默回退')

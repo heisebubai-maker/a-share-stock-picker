@@ -5,6 +5,8 @@ if exist ".venv\Scripts\python.exe" goto install
 py -3.12 -m venv .venv
 if errorlevel 1 goto fail
 :install
+".venv\Scripts\python.exe" -m pip --version >nul 2>&1
+if errorlevel 1 goto fail
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 if errorlevel 1 goto fail
 echo Open http://127.0.0.1:8000 in your browser. Ctrl+C to stop.
@@ -12,6 +14,8 @@ echo Open http://127.0.0.1:8000 in your browser. Ctrl+C to stop.
 if errorlevel 1 goto fail
 exit /b 0
 :fail
-echo Startup failed. Install Python 3.12 with the Python launcher, check network and port 8000.
+echo Startup failed. Install Python 3.12 with pip and Python launcher.
+echo If .venv was created incompletely, rename it and try again.
+echo Check network and port 8000. Do not close this window before reading errors.
 pause
 exit /b 1

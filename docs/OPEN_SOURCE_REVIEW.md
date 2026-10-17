@@ -11,10 +11,16 @@
 
 ## 决策
 
-独立实现 FastAPI + Python 标准库 sqlite3 + 原生静态前端。无需 Node 构建，便于 Windows 本地启动。拆分 provider、storage、strategy 和 API；未来可以增加真实行情适配器，并显式显示来源和新鲜度。第一阶段仅模拟模式，不实现真实行情回退、AI 训练或下单。
+独立实现 FastAPI + Python 标准库 sqlite3 + 原生静态前端。无需 Node 构建，便于 Windows 本地启动。拆分 provider、storage、strategy 和 API。初始版本为模拟模式；后续真实日线更新增加 BaoStock 适配器，显示来源与缓存日期，无AI训练或下单。
 
 无上游代码复制，因而没有捆绑上述项目的许可证文件。将来若复制 MIT 代码，需随复制部分保留相应版权和许可全文；未确认许可证的代码不纳入。
 
 ## 直接依赖
 
 FastAPI（MIT）、Uvicorn（BSD-3-Clause）、HTTPX（BSD-3-Clause）、pytest（MIT）。分别参见 [FastAPI](https://github.com/fastapi/fastapi/blob/master/LICENSE)、[Uvicorn](https://github.com/encode/uvicorn/blob/main/LICENSE.md)、[HTTPX](https://github.com/encode/httpx/blob/master/LICENSE.md)、[pytest](https://github.com/pytest-dev/pytest/blob/main/LICENSE)。安装时保留包内许可证；传递依赖保留其自身许可。模拟数据为本项目生成，不包含第三方行情数据。真实行情接入前须另外核实供应商授权、访问限制和再分发条件。
+
+## 真实日线接口更新（2026-10-17）
+
+新增 [baostock 0.9.4](https://pypi.org/project/baostock/)，发布页许可证元数据为 BSD License，介绍其免费中国股票数据服务。通过SDK调用官方服务，不复制上游源码；安装包及其依赖许可证需保留。公开元数据并不等于行情可任意再分发授权，本仓库不提交下载行情或运行数据库，默认用于本机个人研究。商业使用和再分发应核实供应商条款。
+
+接口依据：[Python API文档](https://github.com/zxygithub/baostock/blob/master/docs/pythonAPI.md)与[发行方示例](https://pypi.org/project/baostock/)。使用匿名login/logout、股票基本资料和日K查询；adjustflag=3为不复权。选用完整ST/交易状态字段，避免依赖股票名称猜测历史状态。单次查询有进程级超时与一次重试，不采用未经核实的多源字段拼接。

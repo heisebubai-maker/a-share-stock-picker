@@ -25,6 +25,22 @@ def initialize(path, provider):
         CREATE TABLE IF NOT EXISTS reviews (
           source TEXT, day TEXT, strategy TEXT, summary TEXT NOT NULL,
           notes TEXT NOT NULL DEFAULT '', PRIMARY KEY(source,day,strategy));
+        CREATE TABLE IF NOT EXISTS sync_state (
+          source TEXT PRIMARY KEY, updated_at TEXT NOT NULL, start TEXT NOT NULL,
+          end TEXT NOT NULL, codes TEXT NOT NULL, row_count INTEGER NOT NULL);
         ''')
         db.executemany('INSERT OR IGNORE INTO bars VALUES (:code,:name,:day,:close,:amount,:is_st,:suspended,:source)',
                        [dict(row, source=provider.name) for row in provider.bars()])
+
+
+def save_market(path, source, rows, codes, start, end):
+    import json
+    from datetime import datetime, timezone
+    with connect(path) as db:
+        # Current cache is exactly the requested pool/range; never mix stale stocks.
+        db.execute('DELETE FROM bars WHERE source=?', (source,))
+        db.executemany('INSERT INTO bars VALUES (:code,:name,:day,:close,:amount,:is_st,:suspended,:source)',
+                       [dict(row, source=source) for row in rows])
+        db.execute('''INSERT OR REPLACE INTO sync_state VALUES (?,?,?,?,?,?)''',
+                   (source, datetime.now(timezone.utc).isoformat(), start.isoformat(),
+                    end.isoformat(), json.dumps(codes), len(rows)))

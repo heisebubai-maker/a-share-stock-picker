@@ -10,7 +10,7 @@ from app.strategy import evaluate
 
 @pytest.fixture
 def client(tmp_path):
-    with TestClient(create_app(tmp_path / 'test.sqlite3')) as c:
+    with TestClient(create_app(tmp_path / 'test.sqlite3', source='demo')) as c:
         yield c
 
 
@@ -30,7 +30,7 @@ def test_screen_and_validation(client):
 def test_review_persistence_and_idempotency(tmp_path):
     path = tmp_path / 'persistent.sqlite3'
     for iteration in range(2):
-        with TestClient(create_app(path)) as c:
+        with TestClient(create_app(path, source='demo')) as c:
             day = c.get('/api/dates').json()[0]
             url = '/api/reviews/' + day
             if iteration == 0:
@@ -59,7 +59,7 @@ def test_filters_and_future_data(client):
 
 
 def test_static_and_cross_origin(client):
-    assert '模拟数据' in client.get('/').text
+    assert '真实日线同步' in client.get('/').text
     assert client.get('/static/app.js').status_code == 200
     assert client.post('/api/reviews/2026-10-16',headers={'Origin':'https://evil.example'}).status_code == 403
     with pytest.raises(ValueError): get_provider('live')
