@@ -7,6 +7,8 @@ from statistics import mean
 from .market import china_today
 from .storage import connect
 from .strategy import evaluate
+from .strategy_lab import assess, load_strategy
+import json
 
 BENCHMARK_NAMES = {'sh.000001':'上证指数', 'sh.000300':'沪深300', 'sz.399006':'创业板指'}
 
@@ -40,7 +42,10 @@ def candidate_plan(metrics, settings, equity, allowed):
 
 
 def build_report(path, source, requested_day=None):
+    strategy=load_strategy(path)
     with connect(path) as db:
+        scan_row=db.execute('SELECT payload FROM universe_scan WHERE id=1').fetchone()
+        scan_info=json.loads(scan_row[0]) if scan_row else None
         settings=dict(db.execute('SELECT * FROM preferences WHERE id=1').fetchone())
         holdings=[dict(r) for r in db.execute('SELECT * FROM holdings ORDER BY code')]
         feed=db.execute('SELECT vendor,note FROM feed_status WHERE source=?',(source,)).fetchone()
@@ -73,13 +78,15 @@ def build_report(path, source, requested_day=None):
     daily=[]
     sectors=defaultdict(list)
     ranked=[]
+    rejected=defaultdict(int)
     for series in current:
         metric=indicators(series)
         if metric:
             daily.append(metric['change_pct'])
             sector=series[-1].get('sector')
             if sector: sectors[sector].append(metric['change_pct'])
-        score=evaluate(series)
+        score,reason=assess(series,strategy)
+        if reason: rejected[reason]+=1
         if score and metric:
             ranked.append(dict(**score,**{k:v for k,v in metric.items() if k not in score},
                                sector=series[-1].get('sector'),pe=series[-1].get('pe'),pb=series[-1].get('pb')))
@@ -144,22 +151,23 @@ def build_report(path, source, requested_day=None):
     sector_counts=defaultdict(int)
     held_codes={h['code'] for h in holdings}
     for item in ranked:
-        if item['code'] in held_codes or item['score']<65 or item['close']<item['ma20']:
+        if item['code'] in held_codes:
             continue
         if item['pe'] is not None and item['pe']<=0:
             continue
         sector_key=item['sector'] or item['code']
-        if sector_counts[sector_key]>=2:
+        if sector_counts[sector_key]>=strategy.sector_limit:
             continue
         sector_counts[sector_key]+=1
         reasons=[f"规则评分{item['score']:.1f}/100，收盘高于20期均线，20期涨跌{item['momentum_pct']:+.2f}%。",
-                 '成交额达到筛选门槛，当前非ST且未停牌。']
+                 f"策略：{strategy.name}；20期日均成交额达到{strategy.min_amount:g}亿元门槛；成交额比{item['amount_ratio']:.2f}。",
+                 '交易状态已核验。' if item['verified'] else '交易状态未核验：仅作为观察名单，不生成可执行仓位。']
         if item['pe'] is not None: reasons.append(f"接口PE(TTM) {item['pe']:.1f}；未按行业估值，不代表便宜。")
-        candidates.append(dict(**item,reasons=reasons,action='满足条件后观察机会' if allowed else '仅观察，暂不形成新增仓位计划',
-                               plan=candidate_plan(item,settings,equity,allowed),
+        candidates.append(dict(**item,reasons=reasons,action='满足条件后观察机会' if allowed and item['verified'] else '仅观察，暂不形成新增仓位计划',
+                               plan=candidate_plan(item,settings,equity,allowed and item['verified']),
                                risks=['未验证盈利质量、财务真实性、公告与估值合理性，技术候选不等于基本面优质股。',
                                       '不复权价格可能受除权影响；不含滑点、涨跌停与可成交性判断。']))
-        if len(candidates)>=5: break
+        if len(candidates)>=strategy.top_k: break
     if equity:
         # Respect remaining aggregate exposure, as well as independent per-stock caps.
         remaining=max(0,equity*settings['max_total_pct']/100-known_value)
@@ -180,7 +188,7 @@ def build_report(path, source, requested_day=None):
     if settings['cash']==0: tasks.append('未录入可用现金，候选股的新增股数上限为0；请先填写账户与风险参数。')
     if not candidates and day and vendor!='tencent_fallback': tasks.append('当前股票池没有达到候选门槛的个股；允许空结果，不强行推荐。')
     tasks.extend(f"{p['code']}：{p['action']}" for p in portfolio if p['status'] not in ('趋势保持',))
-    return dict(version='research-v1',source=source,vendor=vendor,feed_note=feed_note,simulated=simulated,day=day,age_days=age,stale=stale,
+    return dict(version='research-v2',strategy=strategy.model_dump(),scan=scan_info,rejections=dict(rejected),source=source,vendor=vendor,feed_note=feed_note,simulated=simulated,day=day,age_days=age,stale=stale,
                 market=dict(regime=regime,indices=market_indices,pool_size=len(groups),available=len(current),
                             up=sum(x>0 for x in daily),down=sum(x<0 for x in daily),
                             sectors=[dict(name=k,change_pct=round(mean(v),2),count=len(v))

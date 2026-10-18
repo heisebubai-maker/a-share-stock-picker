@@ -1,4 +1,5 @@
 const $=id=>document.getElementById(id);
+let strategyData=null;
 let busy=false, updating=false, metadata=null, report=null, timer=null, hasReview=false;
 const money=value=>value==null?'待补齐':Number(value).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2});
 const pct=value=>value==null?'待补齐':`${Number(value).toFixed(2)}%`;
@@ -11,6 +12,7 @@ async function api(url,method='GET',body){
   return data;
 }
 function controls(){
+  $('market-scan').disabled=busy||updating||metadata?.simulated;
   $('sync').disabled=busy||updating||metadata?.simulated;
   $('backup-sync').disabled=busy||updating||metadata?.simulated;
   ['screen','generate'].forEach(id=>$(id).disabled=busy||!$('day').value);
@@ -33,7 +35,7 @@ function renderMarket(){
 }
 function renderPicks(){
   const box=$('picks');box.replaceChildren();
-  if(!report.candidates.length){empty(box,report.vendor==='tencent_fallback'?'备用线路已更新价格，但缺少ST/停牌状态，当前暂停候选筛选；主源恢复后再生成完整计划。':report.day?'当前没有符合条件的新候选。先处理已有持仓，不为凑数放宽规则。':'点击“一键更新行情与复盘”，再查看基于行情筛出的候选。');return;}
+  if(!report.candidates.length){empty(box,report.vendor==='tencent_fallback'?'当前策略没有合格观察股；下方筛选说明列出淘汰原因，可调整规则后重算。':report.day?'当前没有符合条件的新候选。先处理已有持仓，不为凑数放宽规则。':'点击“一键更新行情与复盘”，再查看基于行情筛出的候选。');return;}
   for(const item of report.candidates){
     const card=el('article',null,'card');card.append(el('h3',`${item.name} · ${item.code}`),el('span',item.action,'tag'),el('p',`${money(item.close)} 元 · 评分 ${item.score.toFixed(1)} / 100`,'big'));
     card.append(el('p',`${item.sector||'行业未取得'} · PE(TTM) ${item.pe==null?'缺失':item.pe.toFixed(1)} · PB ${item.pb==null?'缺失':item.pb.toFixed(2)}`,'muted'));
@@ -63,7 +65,7 @@ function renderHoldings(){
 async function loadDashboard(){
   report=await api('/api/dashboard');
   $('asof').textContent=report.day?`行情日期 ${report.day}${report.stale?' · 缓存较旧':''}`:'尚无行情';
-  renderMarket();renderPicks();renderHoldings();
+  renderMarket();renderPicks();renderHoldings();renderFunnel();
   const settings=report.settings;for(const [id,key]of [['s-cash','cash'],['s-stock','max_stock_pct'],['s-total','max_total_pct'],['s-loss','max_loss_pct'],['s-risk','risk_pct']])$(id).value=settings[key];
   $('limits').textContent=report.limitations.join(' ')+' 本地研究工具，不自动下单。';controls();
 }
@@ -80,7 +82,7 @@ async function loadAll(){
   $('freshness').textContent=metadata.latest_day?`缓存截至 ${metadata.latest_day}；最近同步 ${metadata.sync?new Date(metadata.sync.updated_at).toLocaleString('zh-CN'):'无'}。`:'暂无缓存。';
   if(!$('codes').value)$('codes').value=(metadata.sync?JSON.parse(metadata.sync.codes):metadata.default_codes).join(',');
   const days=await api('/api/dates');$('day').replaceChildren();for(const day of days){const option=el('option',day);option.value=day;$('day').append(option);}
-  await loadDashboard();await loadHistory();await screen();
+  await loadStrategies();await loadDashboard();await loadHistory();await screen();
 }
 async function pollUpdate(){
   try{const state=await api('/api/update-status');updating=state.state==='running';message(state.message);controls();
@@ -98,3 +100,48 @@ $('screen').onclick=()=>run(screen);$('day').onchange=()=>run(screen);
 $('generate').onclick=()=>run(async()=>{await api('/api/reviews/'+$('day').value,'POST');await loadReview();message('因子快照已保存。');});
 $('save').onclick=()=>run(async()=>{await api('/api/reviews/'+$('day').value+'/notes','PUT',{notes:$('notes').value});message('笔记已保存。');});
 run(async()=>{await loadAll();const state=await api('/api/update-status');updating=state.state==='running';if(updating){message(state.message);timer=setTimeout(pollUpdate,1000);}else if(state.state==='done'||state.state==='error')message(state.message);else message('先看市场与持仓风险；需要新数据时点击右上角一键更新。');});
+
+const strategyFields={
+ name:['方案名称','text'],mode:['选股逻辑',{momentum:'趋势动量',breakout:'放量突破',pullback:'强势回调',value:'估值趋势'}],
+ board:['板块范围',{all:'沪深全部',main:'主板',growth:'创业板 + 科创板'}],
+ min_score:['最低评分',0,100],min_amount:['20日日均成交额（亿元）',.1,1000],
+ min_momentum:['20日涨幅下限（%）',-90,300],max_momentum:['20日涨幅上限（%）',-90,500],
+ max_daily_change:['单日涨幅上限（%）',0,30],
+ max_volatility:['日收益波动上限（%）',.1,30],max_cap:['初筛总市值上限（亿元）',1,100000],
+ max_pe:['估值策略PE上限',1,500],min_history:['最少历史交易日',21,120],
+ top_k:['候选数量',1,20],sector_limit:['同一行业最多',1,20],
+ momentum_weight:['动量权重',0,100],trend_weight:['趋势权重',0,100],
+ stability_weight:['稳定性权重',0,100],liquidity_weight:['流动性权重',0,100],
+ allow_unverified:['交易状态缺失时',{true:'显示观察名单，禁止新增仓位',false:'排除，不显示'}]
+};
+function editStrategy(config){
+ const box=$('strategy-fields');box.replaceChildren();
+ const advanced=el('details');advanced.style.gridColumn='1 / -1';advanced.append(el('summary','调整筛选门槛、评分权重与风险过滤'));
+ const grid=el('div',null,'form-grid');advanced.append(grid);
+ for(const [key,def] of Object.entries(strategyFields)){
+  const label=el('label',def[0]);let input;
+  if(typeof def[1]==='object'){input=el('select');for(const [value,title] of Object.entries(def[1])){const option=el('option',title);option.value=value;input.append(option);}}
+  else{input=el('input');input.type=def[1]==='text'?'text':'number';if(input.type==='number'){input.min=def[1];input.max=def[2];input.step=['min_history','top_k','sector_limit'].includes(key)?'1':'any';}else input.maxLength=40;}
+  input.id='cfg-'+key;input.value=String(config[key]);input.required=true;label.append(input);(['name','mode','board','top_k'].includes(key)?box:grid).append(label);
+ }
+ box.append(advanced);
+}
+async function loadStrategies(){
+ strategyData=await api('/api/strategies');
+ const preset=$('strategy-preset');preset.replaceChildren(el('option','选择模板（加载后需保存）'));
+ for(const [key,value] of Object.entries(strategyData.presets)){const o=el('option',value.name);o.value=key;preset.append(o);}
+ const saved=$('strategy-saved');saved.replaceChildren(el('option','选择已有方案'));
+ for(const value of strategyData.profiles){const o=el('option',value.name);o.value=value.name;saved.append(o);}
+ editStrategy(strategyData.active);$('active-strategy').textContent='当前启用：'+strategyData.active.name;
+}
+function renderFunnel(){
+ const scan=report.scan;let text=scan?`上次市场扫描：${scan.total}只 → 沪深覆盖${scan.supported}只 → 初筛合格${scan.qualified}只 → 下载${scan.items.length}只入围股。${scan.note}`:'当前为自选缓存池；点击全市场初筛可扩展研究范围。';
+ if(scan&&JSON.stringify(scan.strategy)!==JSON.stringify(report.strategy))text+=' 策略已改变：需重新扫描才能按新范围发现股票。';
+ text+=' 当前日线淘汰原因：'+(Object.entries(report.rejections).map(([k,v])=>`${k} ${v}只`).join('；')||'无')+`。展示${report.candidates.length}只（持仓不重复推荐）。`;
+ $('strategy-funnel').textContent=text;
+}
+$('strategy-preset').onchange=()=>{const value=strategyData.presets[$('strategy-preset').value];if(value)editStrategy(value);};
+$('strategy-saved').onchange=()=>{const value=strategyData.profiles.find(v=>v.name===$('strategy-saved').value);if(value)editStrategy(value);};
+$('strategy-form').onsubmit=event=>{event.preventDefault();run(async()=>{const config={};for(const key of Object.keys(strategyFields)){const value=$('cfg-'+key).value;config[key]=key==='allow_unverified'?value==='true':['name','mode','board'].includes(key)?value:Number(value);}await api('/api/strategies','PUT',config);await loadStrategies();await loadDashboard();$('study-result').replaceChildren();message('策略已保存并启用，缓存候选已重算。修改市场范围后，请重新扫描市场。');});};
+$('market-scan').onclick=()=>run(async()=>{await api('/api/update','POST',{universe:'market',feed:'backup'});updating=true;message('按已保存策略扫描市场；完成后自动更新候选与持仓。');if(!timer)timer=setTimeout(pollUpdate,1000);});
+$('study-run').onclick=()=>run(async()=>{const h=Number($('study-horizon').value),cost=Number($('study-cost').value);const r=await api(`/api/strategy-study?horizon=${h}&cost_pct=${cost}`);const box=$('study-result');box.replaceChildren(el('p',`策略 ${r.strategy.name} · 样本 ${r.count} · 平均净变化 ${pct(r.mean_pct)} · 正收益占比 ${pct(r.win_rate)} · 最差单笔 ${pct(r.worst_pct)}`),el('p',r.note,'muted'));if(!r.count)box.append(el('p','样本不足或没有历史信号；这不等于收益为0。'));message('历史信号检验完成。');});

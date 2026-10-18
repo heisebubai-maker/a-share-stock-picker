@@ -17,6 +17,9 @@ from .strategy import VERSION, evaluate
 from .market import DEFAULT_CODES, DataError, china_today, download, normalize_codes
 from .research import build_report
 from .backup_feed import download_backup
+from .strategy_lab import StrategyConfig, PRESETS, load_strategy
+from .universe import scan
+from .validation import study
 
 ROOT = Path(__file__).resolve().parent
 
@@ -55,6 +58,7 @@ class Preferences(BaseModel):
 
 
 class SyncRequest(BaseModel):
+    universe: Literal['custom','market'] = 'custom'
     feed: Literal['auto','backup'] = 'auto'
     codes: list[str] = Field(default_factory=lambda: list(DEFAULT_CODES), min_length=1, max_length=50)
     start: date = Field(default_factory=lambda: china_today() - timedelta(days=180))
@@ -166,7 +170,7 @@ def create_app(db_path=None, source=None):
                 except DataError as backup_error:
                     raise DataError(f'主线路和备用线路均未更新成功。{primary_error}；{backup_error}') from backup_error
                 vendor='tencent_fallback'
-                note='近期价格与成交额来自腾讯HTTPS备用线路；早期历史可含BaoStock缓存。ST/停牌状态未取得，暂停新增选股与操作计划。行业仅为缓存参考，PE/PB未补造。'
+                note='近期价格与成交额来自腾讯HTTPS备用线路；早期历史可含BaoStock缓存。ST/停牌状态未取得，仅显示待核验观察名单，暂停新增仓位计划。行业仅为缓存参考，PE/PB未补造。'
             save_market(path, provider.name, bundle['rows'], codes, payload.start, payload.end,bundle['benchmarks'],refresh_from,vendor,note)
             result=data_status()
             latest=result['latest_day']
@@ -186,6 +190,28 @@ def create_app(db_path=None, source=None):
     @app.get('/api/dashboard')
     def dashboard(day: date | None = None):
         return build_report(path,provider.name,day)
+
+    @app.get('/api/strategies')
+    def strategies():
+        with connect(path) as db:
+            profiles=[json.loads(r[0]) for r in db.execute('SELECT payload FROM strategy_profiles ORDER BY name')]
+        return dict(active=load_strategy(path).model_dump(),presets=PRESETS,profiles=profiles)
+
+    @app.get('/api/strategy-study')
+    def strategy_study(horizon: int = Query(5,ge=1,le=20),cost_pct: float = Query(.3,ge=0,le=5)):
+        return study(path,provider.name,load_strategy(path),horizon,cost_pct)
+
+    @app.put('/api/strategies')
+    def save_strategy(payload: StrategyConfig):
+        with job_lock:
+            if job['state']=='running': raise HTTPException(409,'更新期间不能切换策略，请等待完成')
+            with connect(path) as db:
+                count=db.execute('SELECT COUNT(*) FROM strategy_profiles').fetchone()[0]
+                if count>=30 and not db.execute('SELECT 1 FROM strategy_profiles WHERE name=?',(payload.name,)).fetchone():
+                    raise HTTPException(422,'最多保存30个策略方案')
+                db.execute('UPDATE strategy_profiles SET active=0')
+                db.execute('INSERT OR REPLACE INTO strategy_profiles VALUES(?,?,1)',(payload.name,payload.model_dump_json()))
+        return strategies()
 
     @app.get('/api/holdings')
     def holdings():
@@ -263,7 +289,22 @@ def create_app(db_path=None, source=None):
                        started_at=datetime.now(timezone.utc).isoformat(),finished_at=None)
         def work():
             try:
+                if payload.universe=='market':
+                    with job_lock: job['message']='正在扫描全市场快照，按策略初筛，随后下载入围股票日线…'
+                    with connect(path) as db:
+                        held=[r[0] for r in db.execute('SELECT code FROM holdings')]
+                    slots=min(40,50-len(held))
+                    if slots<1: raise DataError('持仓已占满50只，请使用自选池更新')
+                    config=load_strategy(path)
+                    universe=scan(config,slots)
+                    payload.codes=list(dict.fromkeys([i['code'] for i in universe['items']]+held))
+                    with job_lock: job['message']=f"扫描{universe['total']}只，初筛合格{universe['qualified']}只；正在下载{len(payload.codes)}只日线…"
                 result=sync(payload)
+                with connect(path) as db:
+                    if payload.universe=='market':
+                        universe['strategy']=config.model_dump()
+                        db.execute('INSERT OR REPLACE INTO universe_scan VALUES(1,?)',(json.dumps(universe,ensure_ascii=False),))
+                    else: db.execute('DELETE FROM universe_scan')
                 store_report()
                 state,message='done',result['message']
             except Exception as exc:
