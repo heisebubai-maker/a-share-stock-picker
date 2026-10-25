@@ -6,7 +6,11 @@ py -3.12 -m venv .venv
 if errorlevel 1 goto fail
 :install
 ".venv\Scripts\python.exe" -m pip --version >nul 2>&1
+if not errorlevel 1 goto dependencies
+echo Repairing missing pip in the local environment...
+".venv\Scripts\python.exe" -m ensurepip --upgrade
 if errorlevel 1 goto fail
+:dependencies
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 if errorlevel 1 goto fail
 echo Browser opens when the service is ready. Keep this window open. Ctrl+C to stop.

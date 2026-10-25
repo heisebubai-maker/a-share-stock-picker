@@ -20,12 +20,23 @@ from .backup_feed import download_backup
 from .strategy_lab import StrategyConfig, PRESETS, load_strategy
 from .universe import scan
 from .validation import study
+from .engines import ENGINES, load_groups, technical_series, rank_engines
+from .csv_import import parse_csv
 
 ROOT = Path(__file__).resolve().parent
 
 
 class Note(BaseModel):
     notes: str = Field(max_length=5000)
+
+
+class CSVImport(BaseModel):
+    text: str = Field(min_length=1, max_length=2000000)
+    replace_cache: Literal[True]
+
+
+class WatchItem(BaseModel):
+    code: str = Field(min_length=1, max_length=12)
 
 
 class Holding(BaseModel):
@@ -143,7 +154,7 @@ def create_app(db_path=None, source=None):
                 held=[r[0] for r in db.execute('SELECT code FROM holdings')]
             codes=normalize_codes(payload.codes+held)
             refresh_from=None
-            cached=before['sync']
+            cached=before['sync'] if before['vendor']!='local_csv' else None
             with connect(path) as db:
                 index_count=db.execute('SELECT COUNT(*) FROM benchmarks WHERE source=?',(provider.name,)).fetchone()[0]
                 cached_rows=db.execute('''SELECT b.code,b.name,c.sector FROM bars b LEFT JOIN context c
@@ -196,6 +207,71 @@ def create_app(db_path=None, source=None):
         with connect(path) as db:
             profiles=[json.loads(r[0]) for r in db.execute('SELECT payload FROM strategy_profiles ORDER BY name')]
         return dict(active=load_strategy(path).model_dump(),presets=PRESETS,profiles=profiles)
+
+    @app.get('/api/engines')
+    def engines():
+        return ENGINES
+
+    @app.get('/api/engine-screen')
+    def engine_screen(engine: Literal['quanti_ma','quanti_rsi','macd','breakout']='quanti_ma', day: date | None=None):
+        return rank_engines(path, provider.name, engine, day.isoformat() if day else None)
+
+    @app.get('/api/instruments')
+    def instruments():
+        with connect(path) as db:
+            rows = db.execute('''SELECT b.* FROM bars b JOIN
+              (SELECT code,MAX(day) AS last_day FROM bars WHERE source=? GROUP BY code) x
+              ON b.code=x.code AND b.day=x.last_day WHERE b.source=? ORDER BY b.code''',
+                              (provider.name, provider.name)).fetchall()
+        return [dict(r) for r in rows]
+
+    @app.get('/api/series/{code}')
+    def series(code: str, day: date | None=None):
+        selected, groups = load_groups(path, provider.name, day.isoformat() if day else None)
+        rows = groups.get(code)
+        if not rows:
+            raise HTTPException(404, '此代码暂无缓存行情，先更新或导入CSV')
+        return dict(code=code, name=rows[-1]['name'], source=provider.name, simulated=simulated,
+                    as_of=selected, latest_day=rows[-1]['day'], adjustment='none',
+                    points=technical_series(rows),
+                    note='日线收盘曲线，非盘中价格；无开高低字段，不绘制虚构K线。不复权，除权可能影响指标。')
+
+    @app.get('/api/watchlist')
+    def watchlist():
+        with connect(path) as db:
+            return [dict(r) for r in db.execute('SELECT * FROM watchlist ORDER BY code')]
+
+    @app.put('/api/watchlist')
+    def add_watch(payload: WatchItem):
+        code=payload.code
+        if not (simulated and code in {r['code'] for r in instruments()}):
+            try: code=normalize_codes([code])[0]
+            except ValueError as exc: raise HTTPException(422,str(exc)) from exc
+        with connect(path) as db:
+            if db.execute('SELECT COUNT(*) FROM watchlist').fetchone()[0]>=50 and not db.execute('SELECT 1 FROM watchlist WHERE code=?',(code,)).fetchone():
+                raise HTTPException(422,'自选最多50只')
+            db.execute('INSERT OR IGNORE INTO watchlist VALUES(?,?)',(code,datetime.now(timezone.utc).isoformat()))
+        return watchlist()
+
+    @app.delete('/api/watchlist/{code}')
+    def delete_watch(code: str):
+        with connect(path) as db: db.execute('DELETE FROM watchlist WHERE code=?',(code,))
+        return watchlist()
+
+    @app.post('/api/import-csv')
+    def import_csv(payload: CSVImport):
+        if simulated: raise HTTPException(409,'模拟模式不能导入真实数据；请以默认真实模式启动')
+        with job_lock:
+            if job['state']=='running': raise HTTPException(409,'行情更新中，请等待完成')
+            if not sync_lock.acquire(blocking=False): raise HTTPException(409,'同步中，请等待完成')
+            try:
+                rows,codes,start,end=parse_csv(payload.text)
+                save_market(path,provider.name,rows,codes,start,end,benchmarks=[],vendor='local_csv',
+                            note='本地CSV导入：文件真实性与不复权口径由用户核对，ST/停牌状态未核验；指数已清空，仅供研究。')
+                with connect(path) as db: db.execute('DELETE FROM universe_scan')
+            except ValueError as exc: raise HTTPException(422,str(exc)) from exc
+            finally: sync_lock.release()
+        return dict(imported=len(rows),codes=codes,start=str(start),end=str(end),vendor='local_csv')
 
     @app.get('/api/strategy-study')
     def strategy_study(horizon: int = Query(5,ge=1,le=20),cost_pct: float = Query(.3,ge=0,le=5)):
@@ -353,7 +429,11 @@ def create_app(db_path=None, source=None):
 
     @app.get("/")
     def index():
-        return FileResponse(ROOT / "static" / "index.html")
+        return FileResponse(ROOT / "static" / "terminal.html")
+
+    @app.get('/classic')
+    def classic():
+        return FileResponse(ROOT / 'static' / 'index.html')
 
     app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
     return app

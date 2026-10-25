@@ -51,6 +51,8 @@ def initialize(path, provider):
           name TEXT PRIMARY KEY, payload TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS universe_scan (
           id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS watchlist (
+          code TEXT PRIMARY KEY, added_at TEXT NOT NULL);
         ''')
         db.executemany('INSERT OR IGNORE INTO bars VALUES (:code,:name,:day,:close,:amount,:is_st,:suspended,:source)',
                        [dict(row, source=provider.name) for row in provider.bars()])
